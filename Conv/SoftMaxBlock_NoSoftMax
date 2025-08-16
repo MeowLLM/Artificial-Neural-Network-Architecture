@@ -1,0 +1,36 @@
+class SoftmaxBlockNoSoftmax(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # Main branch
+        self.main_conv = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+
+        # Concat branch
+        self.concat_conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.concat_conv2 = nn.Conv2d(out_channels*2, out_channels, 1)
+
+        # Gate branches
+        self.gate_conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.gate_conv2 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.gate_conv3 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+
+        self.relu = nn.ReLU()
+        self.pool = nn.AdaptiveAvgPool2d((1,1))
+        self.fc = nn.Linear(out_channels, 10)
+
+    def forward(self, x):
+        main = self.relu(self.main_conv(x))
+        c1 = self.relu(self.concat_conv1(x))
+        concat_out = torch.cat([main, c1], dim=1)
+        concat_out = self.relu(self.concat_conv2(concat_out))
+
+        g1 = self.relu(self.gate_conv1(x))
+        g2 = self.relu(self.gate_conv2(x))
+        g3 = self.relu(self.gate_conv3(x))
+        gate_out = g1 + g2 + g3
+
+        merged = main + concat_out + gate_out
+
+        out = self.pool(merged)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
