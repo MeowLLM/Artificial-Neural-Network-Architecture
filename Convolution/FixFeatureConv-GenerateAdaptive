@@ -1,0 +1,327 @@
+# dynamic_fix_feature.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def _pair(x: int | Tuple[int, int]) -> Tuple[int, int]:
+    return (x, x) if isinstance(x, int) else x
+
+def _to_2tuple(x):
+    if isinstance(x, tuple): return x
+    return (x, x)
+
+# ---------------------------
+# 1) Space-variant per-pixel kernel conv
+# ---------------------------
+
+class DynamicPerPixelConv2d(nn.Module):
+    """
+    Predicts a unique KxK kernel (and optional bias) per spatial location and applies it
+    to the corresponding KxK input patch (space-variant convolution).
+
+    Args:
+        in_ch: input channels
+        out_ch: output channels
+        kernel_size: int or (kH, kW)
+        hidden: hidden channels for kernel predictor (1x1 conv MLP)
+        stride, padding, dilation: as in Conv2d (applied to both unfold and effective conv)
+        groups: groups for the EFFECTIVE conv (prediction still sees all channels)
+        bias: add dynamic bias per pixel
+        norm_pred: L2-normalize predicted kernels across (K*K*Cin/groups) for stability
+        store_kernels: if True, forward(...) returns (y, kernels, bias) so you can "hold" and reuse
+
+    Shapes:
+        x: [B, Cin, H, W]
+        y: [B, Cout, H_out, W_out]
+    """
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int | Tuple[int, int] = 3,
+        hidden: int = 0,
+        stride: int | Tuple[int, int] = 1,
+        padding: int | Tuple[int, int] = 1,
+        dilation: int | Tuple[int, int] = 1,
+        groups: int = 1,
+        bias: bool = True,
+        norm_pred: bool = True,
+        store_kernels: bool = False,
+    ):
+        super().__init__()
+        assert in_ch % groups == 0 and out_ch % groups == 0, "in/out channels must be divisible by groups"
+        self.in_ch, self.out_ch = in_ch, out_ch
+        self.kH, self.kW = _pair(kernel_size)
+        self.stride = _pair(stride)
+        self.padding = _pair(padding)
+        self.dilation = _pair(dilation)
+        self.groups = groups
+        self.with_bias = bias
+        self.norm_pred = norm_pred
+        self.store_kernels = store_kernels
+
+        kvec = self.kH * self.kW * (in_ch // groups)  # per-group receptive vector length
+
+        pred_in = in_ch
+        layers = []
+        if hidden and hidden > 0:
+            layers += [nn.Conv2d(pred_in, hidden, 1), nn.GELU(), nn.Conv2d(hidden, out_ch * kvec, 1)]
+        else:
+            layers += [nn.Conv2d(pred_in, out_ch * kvec, 1)]
+        self.kernel_head = nn.Sequential(*layers)
+
+        if self.with_bias:
+            self.bias_head = nn.Conv2d(in_ch, out_ch, 1)
+
+    def _predict(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Returns:
+            kernels: [B, Cout, kH*kW*(Cin//groups), H_out, W_out]
+            bias:    [B, Cout, H_out, W_out] or None
+        """
+        B, C, H, W = x.shape
+        ker = self.kernel_head(x)
+        # compute output spatial size consistent with unfold below
+        H_out = (H + 2*self.padding[0] - self.dilation[0]*(self.kH-1) - 1)//self.stride[0] + 1
+        W_out = (W + 2*self.padding[1] - self.dilation[1]*(self.kW-1) - 1)//self.stride[1] + 1
+        ker = ker.view(B, self.out_ch, -1, H_out, W_out)  # Kvec axis collapsed
+
+        if self.norm_pred:
+            ker = F.normalize(ker, dim=2, eps=1e-6)
+
+        b = self.bias_head(x) if self.with_bias else None
+        if b is not None:
+            b = F.interpolate(b, size=(H_out, W_out), mode="nearest")
+        return ker, b
+
+    def _unfold(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, Cin*kH*kW, L] with L = H_out*W_out
+        return F.unfold(
+            x,
+            kernel_size=(self.kH, self.kW),
+            dilation=self.dilation,
+            padding=self.padding,
+            stride=self.stride,
+        )
+
+    def forward_with_kernels(
+        self,
+        x: torch.Tensor,
+        kernels: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Apply provided per-pixel kernels to x. Useful to "hold" kernels between steps.
+        """
+        B, C, H, W = x.shape
+        patches = self._unfold(x)  # [B, Cin*kH*kW, L]
+        H_out = (H + 2*self.padding[0] - self.dilation[0]*(self.kH-1) - 1)//self.stride[0] + 1
+        W_out = (W + 2*self.padding[1] - self.dilation[1]*(self.kW-1) - 1)//self.stride[1] + 1
+        L = H_out * W_out
+
+        # Reshape for grouped matching: split Cin by groups inside the Kvec
+        # kernels: [B, Cout, Kvec, H_out, W_out] -> [B, Cout, Kvec, L]
+        ker = kernels.view(B, self.out_ch, -1, L)
+
+        # patches: [B, Cin*kH*kW, L] -> group-aware by reshaping
+        # We'll rely on the prediction already assuming Cin//groups packing.
+        # Matmul per pixel: (Cout, Kvec) @ (Kvec) -> Cout
+        y = torch.einsum('bckl,bkl->bcl', ker, patches)  # [B, Cout, L]
+
+        if bias is not None:
+            y = y + bias.flatten(2)  # [B,Cout,L]
+
+        y = y.view(B, self.out_ch, H_out, W_out)
+        return y
+
+    def forward(self, x: torch.Tensor):
+        kernels, b = self._predict(x)
+        y = self.forward_with_kernels(x, kernels, b)
+        if self.store_kernels:
+            return y, kernels, b
+        return y
+
+
+# ---------------------------
+# 2) Local Attention (message passing between pixels)
+# ---------------------------
+
+class LocalAttentionFix(nn.Module):
+    """
+    Local self-attention over a window (e.g., 3x3/5x5) with multi-heads.
+    Designed to 'fix' features by letting each pixel aggregate its neighbors.
+
+    Optionally, you can bias attention logits with a per-pixel kernel response.
+
+    Args:
+        dim: channels
+        window: neighborhood size for attention (int or (h,w))
+        heads: number of attention heads
+        qkv_bias: add bias to qkv projections
+        attn_scale: if not None, multiplies logits
+        use_kernel_bias: if True, expect `kernel_response` in forward to add into logits
+    """
+    def __init__(
+        self,
+        dim: int,
+        window: int | Tuple[int, int] = 3,
+        heads: int = 4,
+        qkv_bias: bool = True,
+        attn_scale: Optional[float] = None,
+        use_kernel_bias: bool = True,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.winH, self.winW = _pair(window)
+        self.heads = heads
+        self.head_dim = dim // heads
+        assert dim % heads == 0, "dim must be divisible by heads"
+        self.scale = (self.head_dim ** -0.5) if attn_scale is None else attn_scale
+        self.use_kernel_bias = use_kernel_bias
+
+        self.to_qkv = nn.Conv2d(dim, dim * 3, 1, bias=qkv_bias)
+        self.proj = nn.Conv2d(dim, dim, 1)
+
+        # relative positions (optional, small benefit)
+        coord_h = torch.arange(self.winH)
+        coord_w = torch.arange(self.winW)
+        rel = torch.stack(torch.meshgrid(coord_h, coord_w, indexing='ij'), dim=-1).float()  # [h,w,2]
+        rel = rel - torch.tensor([(self.winH-1)/2, (self.winW-1)/2]).float()
+        self.register_buffer("rel_coords", rel, persistent=False)
+
+    def _unfold(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, C, H, W] -> patches [B, C*winH*winW, L]
+        return F.unfold(
+            x,
+            kernel_size=(self.winH, self.winW),
+            padding=(self.winH//2, self.winW//2),
+            stride=1,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        kernel_response: Optional[torch.Tensor] = None,  # [B, 1 or C, H, W] signal to bias attention
+        kernel_bias_strength: float = 0.0,
+    ) -> torch.Tensor:
+        B, C, H, W = x.shape
+        L = H * W
+
+        qkv = self.to_qkv(x)  # [B, 3C, H, W]
+        q, k, v = qkv.chunk(3, dim=1)  # [B,C,H,W] each
+
+        # unfold k and v into windows centered at each pixel
+        k_patch = self._unfold(k).view(B, self.heads, self.head_dim, self.winH*self.winW, L)   # [B,h,d,S,L]
+        v_patch = self._unfold(v).view(B, self.heads, self.head_dim, self.winH*self.winW, L)   # [B,h,d,S,L]
+
+        # queries stay centered
+        q_center = q.view(B, self.heads, self.head_dim, L)  # [B,h,d,L]
+
+        # logits: [B,h,S,L]
+        logits = torch.einsum('bhdl,bhdsl->bhsl', q_center * self.scale, k_patch)
+
+        # optional kernel-driven bias (encourage edges/structure-aware routing)
+        if self.use_kernel_bias and kernel_response is not None and kernel_bias_strength != 0.0:
+            # collapse kernel response to a scalar per position if needed
+            if kernel_response.shape[1] != 1:
+                ker_s = kernel_response.mean(dim=1, keepdim=True)
+            else:
+                ker_s = kernel_response
+            # make a windowed version (same fold as k/v)
+            ker_win = self._unfold(ker_s).view(B, 1, self.winH*self.winW, L)  # [B,1,S,L]
+            logits = logits + kernel_bias_strength * ker_win  # broadcast over heads
+
+        attn = logits.softmax(dim=2)  # softmax over window S
+
+        # aggregate values: [B,h,d,S,L] × [B,h,S,L] -> [B,h,d,L]
+        out = torch.einsum('bhdsl,bhsl->bhdl', v_patch, attn)
+        out = out.reshape(B, C, H, W)
+        out = self.proj(out)
+        return out
+
+
+# ---------------------------
+# 3) Full Block: Kernel Fix + Attention Fix (residual)
+# ---------------------------
+
+class FixFeatureBlock(nn.Module):
+    """
+    Combines:
+      - Dynamic per-pixel kernel conv (local, content-aware)
+      - Local attention message passing (neighborhood connections)
+    with residual connections.
+
+    Args:
+        in_ch, out_ch: channels
+        k_kernel: kernel size for per-pixel dynamic conv
+        attn_window: window for local attention
+        heads: attention heads
+        mix: float in [0,1] — blend factor between kernel output and attention output
+    """
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        k_kernel: int = 3,
+        attn_window: int = 3,
+        heads: int = 4,
+        mix: float = 0.5,
+        hidden_kernel: int = 0,
+        norm_pred: bool = True,
+    ):
+        super().__init__()
+        self.kernel = DynamicPerPixelConv2d(
+            in_ch=in_ch,
+            out_ch=out_ch,
+            kernel_size=k_kernel,
+            padding=k_kernel//2,
+            norm_pred=norm_pred,
+            store_kernels=False,
+            hidden=hidden_kernel,
+        )
+        self.attn = LocalAttentionFix(
+            dim=out_ch,
+            window=attn_window,
+            heads=heads,
+            qkv_bias=True,
+            use_kernel_bias=True,
+        )
+        self.mix = mix
+        self.proj_in = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+        self.norm = nn.BatchNorm2d(out_ch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.proj_in(x)
+        y_kernel = self.kernel(x)                     # [B, C, H, W]
+        y_attn   = self.attn(y_kernel, kernel_response=y_kernel, kernel_bias_strength=0.25)
+        y = (1 - self.mix) * y_kernel + self.mix * y_attn
+        return self.norm(base + y)
+
+
+# ---------------------------
+# 4) Quick sanity check
+# ---------------------------
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    x = torch.randn(2, 16, 32, 32)
+
+    # Dynamic per-pixel kernel alone
+    dyn = DynamicPerPixelConv2d(16, 32, kernel_size=3, padding=1, norm_pred=True)
+    y = dyn(x)
+    print("DynamicPerPixelConv2d:", tuple(y.shape))  # -> (2, 32, 32, 32)
+
+    # Attention fix alone
+    la = LocalAttentionFix(dim=32, window=3, heads=4)
+    z = la(y, kernel_response=y, kernel_bias_strength=0.25)
+    print("LocalAttentionFix:", tuple(z.shape))      # -> (2, 32, 32, 32)
+
+    # Full block
+    block = FixFeatureBlock(16, 32, k_kernel=3, attn_window=3, heads=4, mix=0.5)
+    out = block(x)
+    print("FixFeatureBlock:", tuple(out.shape))      # -> (2, 32, 32, 32)
